@@ -8,7 +8,7 @@ import (
 	"net"
 )
 
-const bufSize = 32 * 1024
+const bufSize = 1460 // 1460 bytes should be sufficient
 
 type writer struct {
 	io.Writer

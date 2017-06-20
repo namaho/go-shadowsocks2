@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
@@ -10,7 +11,7 @@ import (
 	"github.com/shadowsocks/go-shadowsocks2/socks"
 )
 
-const udpBufSize = 64 * 1024
+const udpBufSize = 1460
 
 // Listen on laddr for UDP packets, encrypt and send to server to reach target.
 func udpLocal(laddr, server, target string, shadow func(net.PacketConn) net.PacketConn) {
@@ -55,7 +56,7 @@ func udpLocal(laddr, server, target string, shadow func(net.PacketConn) net.Pack
 			}
 
 			pc = shadow(pc)
-			nm.Add(raddr, c, pc, false)
+			nm.Add(nil, raddr, c, pc, false)
 		}
 
 		_, err = pc.WriteTo(buf[:len(tgt)+n], srvAddr)
@@ -67,29 +68,43 @@ func udpLocal(laddr, server, target string, shadow func(net.PacketConn) net.Pack
 }
 
 // Listen on addr for encrypted packets and basically do UDP NAT.
-func udpRemote(addr string, shadow func(net.PacketConn) net.PacketConn) {
+func udpRemote(ctx *context.Context, addr string, shadow func(net.PacketConn) net.PacketConn) {
+	manager := (*ctx).Value("manager").(*Manager)
+
 	c, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		logf("UDP remote listen error: %v", err)
 		return
 	}
 	defer c.Close()
+	_, port, _ := net.SplitHostPort(c.LocalAddr().String())
+	manager.AddUDPRelay(port, c)
 	c = shadow(c)
 
 	nm := newNATmap(config.UDPTimeout)
-	buf := make([]byte, udpBufSize)
 
 	logf("listening UDP on %s", addr)
 	for {
+		buf := make([]byte, udpBufSize)
 		n, raddr, err := c.ReadFrom(buf)
 		if err != nil {
-			logf("UDP remote read error: %v", err)
-			continue
+			logf("UDP remote read error, exit: %v", err)
+
+			// TODO we should we continue here, and make a mechanism
+			// for detecting socket close, properly and gracefully
+			// shutdown other active connections.
+			break
 		}
 
 		tgtAddr := socks.SplitAddr(buf[:n])
 		if tgtAddr == nil {
 			logf("failed to split target address from packet: %q", buf[:n])
+			continue
+		}
+
+		if manager.IsBlock(tgtAddr.String()) {
+			// udp traffic is negligible compared to tcp, and they log too much, we don't acutally need them
+			// logf("block udp %s -> %s -> %s", raddr.String(), c.LocalAddr().String(), tgtAddr.String())
 			continue
 		}
 
@@ -109,14 +124,19 @@ func udpRemote(addr string, shadow func(net.PacketConn) net.PacketConn) {
 				continue
 			}
 
-			nm.Add(raddr, c, pc, true)
+			// logf("add remote udp conn to natmap(%d) %s:net.PacketConn(%s)", nm.GetSize(), raddr.String(), pc.LocalAddr().String())
+			nm.Add(ctx, raddr, c, pc, true)
 		}
 
-		_, err = pc.WriteTo(payload, tgtUDPAddr) // accept only UDPAddr despite the signature
+		n, err = pc.WriteTo(payload, tgtUDPAddr) // accept only UDPAddr despite the signature
 		if err != nil {
 			logf("UDP remote write error: %v", err)
 			continue
 		}
+		// udp traffic is negligible compared to tcp, and they log too much, we don't acutally need them
+		// logf("udp up %s -> %s -> %s %d", raddr.String(), c.LocalAddr().String(), tgtUDPAddr.String(), n)
+
+		manager.UpdateStats(port, int(n))
 	}
 }
 
@@ -159,11 +179,19 @@ func (m *natmap) Del(key string) net.PacketConn {
 	return nil
 }
 
-func (m *natmap) Add(peer net.Addr, dst, src net.PacketConn, srcIncluded bool) {
+func (m *natmap) GetSize() int {
+	m.Lock()
+	defer m.Unlock()
+	return len(m.m)
+}
+
+func (m *natmap) Add(ctx *context.Context, peer net.Addr, dst, src net.PacketConn, srcIncluded bool) {
 	m.Set(peer.String(), src)
 
 	go func() {
-		timedCopy(dst, peer, src, m.timeout, srcIncluded)
+		if err := timedCopy(ctx, dst, peer, src, m.timeout, srcIncluded); err != nil {
+			logf("send udp error: %v", err)
+		}
 		if pc := m.Del(peer.String()); pc != nil {
 			pc.Close()
 		}
@@ -171,7 +199,7 @@ func (m *natmap) Add(peer net.Addr, dst, src net.PacketConn, srcIncluded bool) {
 }
 
 // copy from src to dst at target with read timeout
-func timedCopy(dst net.PacketConn, target net.Addr, src net.PacketConn, timeout time.Duration, srcIncluded bool) error {
+func timedCopy(ctx *context.Context, dst net.PacketConn, target net.Addr, src net.PacketConn, timeout time.Duration, srcIncluded bool) error {
 	buf := make([]byte, udpBufSize)
 
 	for {
@@ -189,6 +217,14 @@ func timedCopy(dst net.PacketConn, target net.Addr, src net.PacketConn, timeout 
 		} else { // client -> user: strip original packet source
 			srcAddr := socks.SplitAddr(buf[:n])
 			_, err = dst.WriteTo(buf[len(srcAddr):n], target)
+		}
+		// udp traffic is negligible compared to tcp, and they log too much, we don't acutally need them
+		// logf("udp dn %s <- %s <- %s %d", target.String(), src.LocalAddr().String(), raddr.String(), n)
+
+		if ctx != nil {
+			manager := (*ctx).Value("manager").(*Manager)
+			_, port, _ := net.SplitHostPort(dst.LocalAddr().String())
+			manager.UpdateStats(port, int(n))
 		}
 
 		if err != nil {

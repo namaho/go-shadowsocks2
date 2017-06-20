@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net"
 	"time"
 
+	"github.com/juju/ratelimit"
 	"github.com/shadowsocks/go-shadowsocks2/socks"
 )
 
@@ -65,7 +67,7 @@ func tcpLocal(addr, server string, shadow func(net.Conn) net.Conn, getAddr func(
 			}
 
 			logf("proxy %s <-> %s <-> %s", c.RemoteAddr(), server, tgt)
-			_, _, err = relay(rc, c)
+			_, _, err = relay(nil, rc, c)
 			if err != nil {
 				if err, ok := err.(net.Error); ok && err.Timeout() {
 					return // ignore i/o timeout
@@ -77,19 +79,28 @@ func tcpLocal(addr, server string, shadow func(net.Conn) net.Conn, getAddr func(
 }
 
 // Listen on addr for incoming connections.
-func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
+func tcpRemote(ctx *context.Context, addr string, shadow func(net.Conn) net.Conn) {
+	manager := (*ctx).Value("manager").(*Manager)
+
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		logf("failed to listen on %s: %v", addr, err)
 		return
 	}
+	defer l.Close()
+	_, port, _ := net.SplitHostPort(l.Addr().String())
+	manager.AddTCPRelay(port, l)
 
 	logf("listening TCP on %s", addr)
 	for {
 		c, err := l.Accept()
 		if err != nil {
-			logf("failed to accept: %v", err)
-			continue
+			logf("failed to accept, exit: %v", err)
+
+			// TODO we should we continue here, and make a mechanism
+			// for detecting socket close, properly and gracefully
+			// shutdown other active connections.
+			break
 		}
 
 		go func() {
@@ -103,6 +114,11 @@ func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
 				return
 			}
 
+			if manager.IsBlock(tgt.String()) {
+				logf("block %s <-> %s <-> %s", c.RemoteAddr(), c.LocalAddr(), tgt)
+				return
+			}
+
 			rc, err := net.Dial("tcp", tgt.String())
 			if err != nil {
 				logf("failed to connect to target: %v", err)
@@ -111,8 +127,14 @@ func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
 			defer rc.Close()
 			rc.(*net.TCPConn).SetKeepAlive(true)
 
-			logf("proxy %s <-> %s", c.RemoteAddr(), tgt)
-			_, _, err = relay(c, rc)
+			un, dn, err := relay(ctx, c, rc)
+			logf("proxy %s <-> %s <-> %s %d", c.RemoteAddr(), c.LocalAddr(), tgt, int(un+dn))
+
+			// traffic statistics would be calculated after the relay has been done,
+			// we shall wrap the io.Reader and io.Writer just like what ratelimit
+			// package do to make the statistics more smoothly.
+			manager.UpdateStats(port, int(un+dn))
+
 			if err != nil {
 				if err, ok := err.(net.Error); ok && err.Timeout() {
 					return // ignore i/o timeout
@@ -125,21 +147,46 @@ func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
 
 // relay copies between left and right bidirectionally. Returns number of
 // bytes copied from right to left, from left to right, and any error occurred.
-func relay(left, right net.Conn) (int64, int64, error) {
+func relay(ctx *context.Context, left, right net.Conn) (int64, int64, error) {
 	type res struct {
 		N   int64
 		Err error
 	}
 	ch := make(chan res)
 
+	var manager *Manager
+	var leftPort string
+	var leftReader io.Reader
+	var leftWriter io.Writer
+	if ctx != nil {
+		manager = (*ctx).Value("manager").(*Manager)
+		_, leftPort, _ = net.SplitHostPort(left.LocalAddr().String())
+		// left read is the client upload process
+		leftReader = ratelimit.Reader(left, manager.GetUploadLimitBucket(leftPort))
+		// left write is the client download process
+		leftWriter = ratelimit.Writer(left, manager.GetDownloadLimitBucket(leftPort))
+	}
+
 	go func() {
-		n, err := io.Copy(right, left)
+		var n int64
+		var err error
+		if ctx != nil {
+			n, err = io.Copy(right, leftReader)
+		} else {
+			n, err = io.Copy(right, left)
+		}
 		right.SetDeadline(time.Now()) // wake up the other goroutine blocking on right
 		left.SetDeadline(time.Now())  // wake up the other goroutine blocking on left
 		ch <- res{n, err}
 	}()
 
-	n, err := io.Copy(left, right)
+	var n int64
+	var err error
+	if ctx != nil {
+		n, err = io.Copy(leftWriter, right)
+	} else {
+		n, err = io.Copy(left, right)
+	}
 	right.SetDeadline(time.Now()) // wake up the other goroutine blocking on right
 	left.SetDeadline(time.Now())  // wake up the other goroutine blocking on left
 	rs := <-ch

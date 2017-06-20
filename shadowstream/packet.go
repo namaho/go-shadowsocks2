@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
 )
 
 // ErrShortPacket means the packet is too short to be a valid encrypted packet.
@@ -14,10 +13,11 @@ var ErrShortPacket = errors.New("short packet")
 // Pack encrypts plaintext using stream cipher s and a random IV.
 // Returns a slice of dst containing random IV and ciphertext.
 // Ensure len(dst) >= s.IVSize() + len(plaintext).
-func Pack(dst, plaintext []byte, s Cipher) ([]byte, error) {
-	if len(dst) < s.IVSize()+len(plaintext) {
+func Pack(plaintext []byte, s Cipher) ([]byte, error) {
+	if 1460 < s.IVSize()+len(plaintext) {
 		return nil, io.ErrShortBuffer
 	}
+	var dst = make([]byte, 1460)
 	iv := dst[:s.IVSize()]
 	_, err := io.ReadFull(rand.Reader, iv)
 	if err != nil {
@@ -46,19 +46,15 @@ func Unpack(dst, pkt []byte, s Cipher) ([]byte, error) {
 type packetConn struct {
 	net.PacketConn
 	Cipher
-	buf        []byte
-	sync.Mutex // write lock
 }
 
 // NewPacketConn wraps a net.PacketConn with stream cipher encryption/decryption.
 func NewPacketConn(c net.PacketConn, ciph Cipher) net.PacketConn {
-	return &packetConn{PacketConn: c, Cipher: ciph, buf: make([]byte, 64*1024)}
+	return &packetConn{PacketConn: c, Cipher: ciph}
 }
 
 func (c *packetConn) WriteTo(b []byte, addr net.Addr) (int, error) {
-	c.Lock()
-	defer c.Unlock()
-	buf, err := Pack(c.buf, b, c.Cipher)
+	buf, err := Pack(b, c.Cipher)
 	if err != nil {
 		return 0, err
 	}

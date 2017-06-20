@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
 )
 
 // ErrShortPacket means that the packet is too short for a valid encrypted packet.
@@ -16,7 +15,8 @@ var _zerononce [128]byte // read-only. 128 bytes is more than enough.
 // Pack encrypts plaintext using Cipher with a randomly generated salt and
 // returns a slice of dst containing the encrypted packet and any error occurred.
 // Ensure len(dst) >= ciph.SaltSize() + len(plaintext) + aead.Overhead().
-func Pack(dst, plaintext []byte, ciph Cipher) ([]byte, error) {
+func Pack(plaintext []byte, ciph Cipher) ([]byte, error) {
+	dst := make([]byte, 1460)
 	saltSize := ciph.SaltSize()
 	salt := dst[:saltSize]
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
@@ -60,21 +60,16 @@ func Unpack(dst, pkt []byte, ciph Cipher) ([]byte, error) {
 type packetConn struct {
 	net.PacketConn
 	Cipher
-	sync.Mutex
-	buf []byte // write lock
 }
 
 // NewPacketConn wraps a net.PacketConn with cipher
 func NewPacketConn(c net.PacketConn, ciph Cipher) net.PacketConn {
-	const maxPacketSize = 64 * 1024
-	return &packetConn{PacketConn: c, Cipher: ciph, buf: make([]byte, maxPacketSize)}
+	return &packetConn{PacketConn: c, Cipher: ciph}
 }
 
 // WriteTo encrypts b and write to addr using the embedded PacketConn.
 func (c *packetConn) WriteTo(b []byte, addr net.Addr) (int, error) {
-	c.Lock()
-	defer c.Unlock()
-	buf, err := Pack(c.buf, b, c)
+	buf, err := Pack(b, c)
 	if err != nil {
 		return 0, err
 	}
